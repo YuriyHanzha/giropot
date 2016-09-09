@@ -52,24 +52,21 @@
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
-
 SPI_HandleTypeDef hspi1;
-
 TIM_HandleTypeDef htim6;
-
 UART_HandleTypeDef huart1;
 DMA_HandleTypeDef hdma_usart1_rx;
-
 /* USER CODE BEGIN PV */
 
 /* Private variables ---------------------------------------------------------*/
-uint8_t uartData_RX[7]; //сюди записуються посилки даних з УСАПП 
-uint8_t R_EEPROM[8];    //сюди зчитуються дані з ЕЕПРОМ
-uint8_t W_EEPROM[8];    //звідси дані записуються в ЕЕПРОМ
-uint8_t i;						  //змінна загального призначення (для функції "for")
-uint8_t ZAP=0;				  // флаг дозволу запису
-uint8_t MOD=0; 					//флаг що сповіщує про модифікацію налаштувань потенціометрів
-uint32_t RES[4]={100,100,100,100}; //початкові значення для передачі на потенціометри (середина діапазону)
+uint8_t uartData_RX[7]; 	 //сюди записуються посилки даних з УСАПП 
+uint8_t R_EEPROM[8];   		 //сюди зчитуються дані з ЕЕПРОМ
+uint8_t W_EEPROM[8];   		 //звідси дані записуються в ЕЕПРОМ
+uint8_t i;						  	 //змінна загального призначення (для функції "for")
+uint8_t ZAP=0;				 		 // флаг дозволу запису
+uint8_t MOD=0; 					   //флаг що сповіщує про модифікацію налаштувань потенціометрів
+uint8_t data_valid_flag=1; //по замовчуванню дані вірні, якщо хоч раз за цикл верифікації прийметься з помилкою то флаг зкинеться
+uint32_t RES[4]={512,512,512,512}; //початкові значення для передачі на потенціометри (середина діапазону)
 uint8_t DefVal[8]={00,02,00,02,00,02,00,02}; //Масив з 4 значеннями 512 (складено з двох байт молодшим вперед) 
 uint8_t AD5292_data[2]; //для запису слова даних в потенціометри (ініціалізація) 
 volatile uint8_t flag_DMA;  //флаг завершення прийому з УАПП по ДМА 7 байт
@@ -87,13 +84,15 @@ static void MX_TIM6_Init(void);
 
 /* USER CODE BEGIN PFP */
 /* Private function prototypes -----------------------------------------------*/
-void Write_to_EEPROM(void);  //запис в еепром
-void SetToDefVal(void);   //запис 
-void Read_from_EEPROM(void);
-void Receive_from_UART(void);
-void update_RES(void);
-void AD5292_Init(void);
-void led_blink(void);
+void AD5292_Init(void);							//ввімкнення потенціометрів (RESET_ON та передача на кожен з них 0х1803)
+void Write_to_EEPROM(void);  				//запис в еепром RES[4] у 8 ячейок памяті
+void Read_from_EEPROM(void);				//читання з еепром RES[4] з 8 ячейок памяті
+void SetToDefVal(void);   					//запис DefVal[8] в EEPROM, потім читання з нього та видача на потенціометри
+uint8_t Receive_from_UART(void);		//запуск процесу читання даних з початку нової посилки по ДМА, функція поверта результат якщо є передача, а інакше 0хFF
+uint8_t valid_data(uint8_t repeat); //функція звіряє дані задану кількість раз і повертає результат (значення якщо воно вірне, а інакше 0хFF )
+void sort_data(uint8_t uart_data);  //визначення які кнопки натиснуто, зміна значень даних потенціометрів
+void update_RES(void);							//перезапис значень в потенціометрах
+void led_blink(void);								//засвітити світлодіод на 2 сек. для індикації завершення запису
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
@@ -139,14 +138,10 @@ update_RES();//оновити значення в потенціометрах
 
   while (1)
   {
-	// HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_11);  //STATUS LED toggle;
-	Receive_from_UART();  						  //отримання інформації, сортування, підготовка до видачі на потенціометри
-	update_RES();												//оновити значення в потенціометрах
-
-
-		//HAL_Delay(10);
-Write_to_EEPROM();    							//запис поточних значень якщо є на те підстави (супроводжується світінням світлодіоду 1сек.)
-if(BUTTON==RESET){SetToDefVal();}   //Встановити значення DefValue якщо натиснута кнопка зкидання.
+sort_data(valid_data(5)); 					//отримання інформації,верифікація даних, сортування, підготовка до видачі на потенціометри
+update_RES();												//оновити значення в потенціометрах
+Write_to_EEPROM();    							//запис поточних значень якщо є на те підстави (супроводжується світінням світлодіоду 2сек.)
+if(BUTTON==RESET){SetToDefVal();}   //Встановити значення DefValue якщо натиснута кнопка зкидання (супроводжується світінням світлодіоду 2сек.).
   /* USER CODE END WHILE */
 
   /* USER CODE BEGIN 3 */
@@ -339,20 +334,20 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 void Read_from_EEPROM(void)
-				{
+{
 				//	for(i=0;i<8;i++) {R_EEPROM[i]=0;} //очистка в озу попередніх зчитаних з еепром значень
-						//												DevAddress MemAddress MemAddSize	data 			Size timeout  )
-						 HAL_I2C_Mem_Read(&hi2c1, 0xA0, 			0, 					1,			 &R_EEPROM[0], 8,1000); //зчитування 8 байт даних з еепром
-					   HAL_Delay(10);
+						//									DevAddress MemAddress MemAddSize	data 			Size timeout  )
+				HAL_I2C_Mem_Read(&hi2c1, 0xA0, 			0, 					1,			 &R_EEPROM[0], 8,1000); //зчитування 8 байт даних з еепром
+				HAL_Delay(10);
 						
 				RES[0]=R_EEPROM[0]+(R_EEPROM[1]<<8); //сортування зчитаних даних для передачі на потенціометри
 				RES[1]=R_EEPROM[2]+(R_EEPROM[3]<<8);
 				RES[2]=R_EEPROM[4]+(R_EEPROM[5]<<8);
 				RES[3]=R_EEPROM[6]+(R_EEPROM[7]<<8);
-				}
+}
 
 void Write_to_EEPROM(void)
-				{
+{
 						
 							if(ZAP==1) // якщо прийшла команда запису 
 							{
@@ -380,9 +375,9 @@ void Write_to_EEPROM(void)
 										ZAP=0;              //зкидання флагів
 										MOD=0;
 							}
-					}
+}
 void SetToDefVal(void)
-				{
+{
 							Read_from_EEPROM(); //зчитали поточні налаштування, що записані в пам'ять
 							if (RES[0]!=512|RES[1]!=512|RES[2]!=512|RES[3]!=512)  //якщо хоч один з потенціометрів не в середньому значенні то...
 														{
@@ -394,19 +389,42 @@ void SetToDefVal(void)
 															led_blink();
 															Read_from_EEPROM(); //зчитування з еепром в озу останньоЇ записаної конфігурації
 														}
-				}
-void Receive_from_UART(void)
-				{
-					
-							if(TIM6->CNT>10) //якщо таймер зміг дорахувати до 10мс, значить скоро нова посилка.
+}
+				
+uint8_t valid_data(uint8_t repeat) //функція звіряє дані задану кількість раз і повертає значення, якщо вони вірні
+{
+	uint8_t first_value;
+	uint8_t stage_valid_flag=0; //флаг ідентичності окремих послідовних посилок
+	uint8_t out_data=0xFF; ////по замовчуванню функція повертає 0xFF (тобто не в режимі настройки потенціометрів)
+	data_valid_flag=1; //по замовчуванню дані вірні, спробуємо опровергнути це
+	
+	first_value=Receive_from_UART(); //отримуємо перше значення
+				for(i=0;i<repeat;i++) 
+					{
+						if (Receive_from_UART()==first_value) {stage_valid_flag=1;} else {stage_valid_flag=0;}		//звіряємо з першим
+						data_valid_flag=data_valid_flag&stage_valid_flag; //якщо хоч раз не співпаде отримане значення з першим, то дані не вірні.
+					}
+	if(data_valid_flag==1) {out_data=first_value;} //якщо все співпало, то функція видасть зчитане значення, а інакще по замовчуванню присвоєно 0хFF
+	return out_data;
+}
+				
+uint8_t Receive_from_UART(void)
+{
+					uint8_t out_data=0xFF; //по замовчуванню функція повертає 0xFF (тобто не в режимі настройки потенціометрів)
+					while(TIM6->CNT<10){} //очікуємо поки закінчиться стара посилка (висимо тут якщо дані йдуть і таймер систематично перезапускається)
+							if(TIM6->CNT>10) //якщо таймер зміг дорахувати до 10мс, значить скоро нова посилка, бо був перерив в прийомі по УСАПП
 									{
 										uartData_RX[5]=0xFF; //очистка прийомного буфера
 										HAL_UART_Receive_DMA(&huart1,uartData_RX,6); //запуск прийому перших 6 байт даних
 									  flag_DMA=1;
 									  while((flag_DMA==1)&(TIM6->CNT<200)){	}//очікування завершення прийому даних або таймаут 200мс
 										if (RES[0]!=512|RES[1]!=512|RES[2]!=512|RES[3]!=512){ HAL_GPIO_TogglePin(GPIOB,GPIO_PIN_11);}  //STATUS LED toggle;
-										uint8_t uart_data=uartData_RX[5]&0x0F; //маскування 6 байта, 											
-							
+										out_data=uartData_RX[5]&0x0F; //маскування 6 байта, і видача результату 				
+									}
+							return out_data;	
+}
+void sort_data(uint8_t uart_data)
+{	
 							//бітові операції
 							// установлений MOD значить що були внесені зміни до налаштувань, які треба записати.
 							//Значення регулюються від 0 до 1024, програмно обмежена перестройка
@@ -420,48 +438,42 @@ void Receive_from_UART(void)
 					if(uart_data==8   & RES[3]>0)    {RES[3]--;MOD=1;}	//(Дубль)Вертикаль -
 
 					if((uartData_RX[5]==0x0F)&(MOD==1) )    {ZAP=1;}	//Якщо Отримали 0x0F і внесені зміни в настройки то дозволяємо запис в ЕСПЗУ
-
-										//__HAL_UART_ENABLE_IT(&huart1, UART_IT_RXNE);//дозвіл преривань по прийому USART
-										//TIM6->CNT=0; 	//перезапуск таймера
-									}
-				}
+}
+									
 void AD5292_Init(void) //ініціалізація 4x потенціометрів
-				{
-					
+{
+					RESET_OFF; //RDAC power oFF
+					HAL_Delay(100);
 					RESET_ON; //RDAC power on
 					HAL_Delay(100);
+	
 					SYNC_OFF;
-
-							AD5292_data[0]=0x03; //LO byte //Ввімкнути можливість зміни опору. 
-							AD5292_data[1]=0x18;	//HI byte
-							for(i=0;i<4;i++)
-					{	
+					AD5292_data[0]=0x03; //LO byte //Ввімкнути можливість зміни опору. 
+					AD5292_data[1]=0x18;	//HI byte
+					for(i=0;i<4;i++)
+						{	
 							HAL_SPI_Transmit(&hspi1,&AD5292_data[0], 1, 1);
-					}
+						}
 					SYNC_ON;
-						HAL_Delay(100);
-				}
+					//HAL_Delay(100);
+}
 void update_RES(void)  //оновлення значень в 4х потенціометрах
-				{
+{
 					  SYNC_OFF; //почати передачу даних
 						for(i=0;i<4;i++)
 						{
-						AD5292_data[0]=(RES[i] & 0xFF); //LO byte  									//формування слова для запису в потенціометри
-						AD5292_data[1]=((RES[i]>>8)+4);	//HI byte
-						HAL_SPI_Transmit(&hspi1,&AD5292_data[0], 1, 1);							//передача слова даних
-							
+							AD5292_data[0]=(RES[i] & 0xFF); //LO byte  									//формування слова для запису в потенціометри
+							AD5292_data[1]=((RES[i]>>8)+4);	//HI byte
+							HAL_SPI_Transmit(&hspi1,&AD5292_data[0], 1, 1);							//передача слова даних
 						}
 				  	SYNC_ON;	//завершити передачу даних
-						//HAL_Delay(10);
-				}
-
-
+}
 void led_blink(void)
-				{
-					HAL_GPIO_WritePin(GPIOB,GPIO_PIN_11, GPIO_PIN_SET);  //STATUS LED ON;//Індикація операції запису в память
-					HAL_Delay(2000);
-					HAL_GPIO_WritePin(GPIOB,GPIO_PIN_11, GPIO_PIN_RESET);  //STATUS LED OFF;
-				}
+{
+		HAL_GPIO_WritePin(GPIOB,GPIO_PIN_11, GPIO_PIN_SET);  //STATUS LED ON;//Індикація операції запису в память
+		HAL_Delay(2000);
+		HAL_GPIO_WritePin(GPIOB,GPIO_PIN_11, GPIO_PIN_RESET);  //STATUS LED OFF;
+}
 /* USER CODE END 4 */
 
 /**
